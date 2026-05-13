@@ -1,5 +1,6 @@
 import requests
 from bs4 import BeautifulSoup
+import xml.etree.ElementTree as ET
 import schedule
 import time
 import sqlite3
@@ -18,27 +19,22 @@ SUBREDDITS = [
     "ITCareerQuestions", "datascience", "forhire",
 ]
 
-REDDIT_KEYWORDS = [
-    "resume review", "resume help", "us resume", "resume for usa",
-    "h1b resume", "opt resume", "ats resume", "resume feedback",
-    "job search usa", "american resume", "resume critique",
-    "roast my resume", "getting callbacks", "no callbacks",
-    "resume format usa", "job hunt usa", "f1 visa job",
-    "opt job", "h1b job", "resume help india",
-]
-
-X_KEYWORDS = [
-    "resume help usa", "h1b resume", "opt resume",
-    "ats resume india", "resume for us companies",
-    "job search usa india", "resume review please",
-    "h1b job search", "opt job search usa",
+# Широкие ключевые слова — одиночные слова и короткие фразы
+KEYWORDS = [
+    "resume", "cv", "h1b", "opt", "ats", "visa",
+    "job usa", "jobs usa", "work usa", "us job",
+    "job search", "callback", "interview",
+    "relocate", "relocation", "green card",
+    "software engineer", "data analyst", "developer",
+    "hiring", "apply", "application", "rejection",
+    "linkedin", "cover letter", "job offer",
 ]
 
 QUORA_QUERIES = [
-    "site:quora.com resume USA Indian professional",
-    "site:quora.com H1B resume tips India",
-    "site:quora.com OPT resume US format",
-    "site:quora.com ATS resume India US job",
+    "site:quora.com resume USA Indian",
+    "site:quora.com H1B resume",
+    "site:quora.com OPT job USA",
+    "site:quora.com ATS resume India",
 ]
 
 def init_db():
@@ -71,63 +67,100 @@ def total_seen():
     return rows
 
 def get_priority(text):
-    hot = ["please help", "urgent", "need help", "struggling", "no callbacks",
-           "not getting", "rejected", "roast my", "help me", "desperate", "frustrated"]
-    return "🔴 ГОРЯЧИЙ" if any(w in text.lower() for w in hot) else "🟡 ТЁПЛЫЙ"
+    text = text.lower()
+    hot = ["help", "urgent", "struggling", "no callbacks", "rejected",
+           "please review", "roast my", "desperate", "frustrated",
+           "no response", "not getting", "advice needed"]
+    return "🔴 ГОРЯЧИЙ" if any(w in text for w in hot) else "🟡 ТЁПЛЫЙ"
 
 def send(message):
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-                "parse_mode": "Markdown",
-                "disable_web_page_preview": False
-            },
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": message,
+                  "parse_mode": "Markdown", "disable_web_page_preview": False},
             timeout=10
         )
-        log.info("✅ Telegram OK" if resp.status_code == 200 else f"❌ {resp.text}")
+        if resp.status_code == 200:
+            log.info("✅ Telegram OK")
+        else:
+            log.error(f"❌ Telegram: {resp.text}")
     except Exception as e:
         log.error(f"❌ Telegram: {e}")
 
 def check_reddit():
     log.info("🔍 Reddit...")
     found = 0
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; bot/1.0)"}
+
     for sub in SUBREDDITS:
         try:
             resp = requests.get(
-                f"https://www.reddit.com/r/{sub}/new/.rss?limit=25",
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=15
+                f"https://www.reddit.com/r/{sub}/new/.rss?limit=20",
+                headers=headers, timeout=15
             )
             if resp.status_code != 200:
+                log.warning(f"r/{sub}: HTTP {resp.status_code}")
+                time.sleep(2)
                 continue
 
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for entry in soup.find_all("entry"):
-                pid_tag = entry.find("id")
-                if not pid_tag:
+            # Парсим XML через ElementTree
+            try:
+                root = ET.fromstring(resp.content)
+            except ET.ParseError:
+                log.error(f"r/{sub}: XML parse error")
+                continue
+
+            # Пространства имён RSS/Atom
+            ns = {"atom": "http://www.w3.org/2005/Atom"}
+            entries = root.findall("atom:entry", ns)
+            if not entries:
+                entries = root.findall(".//{http://www.w3.org/2005/Atom}entry")
+
+            for entry in entries:
+                # ID
+                id_el = entry.find("{http://www.w3.org/2005/Atom}id")
+                if id_el is None:
+                    id_el = entry.find("id")
+                if id_el is None:
                     continue
-                post_id = f"reddit_{pid_tag.text.strip()[-10:]}"
+                post_id = f"reddit_{id_el.text.strip()[-12:]}"
                 if is_seen(post_id):
                     continue
 
-                title = entry.find("title").text.strip() if entry.find("title") else ""
-                link_tag = entry.find("link")
-                link = link_tag.get("href", "") if link_tag else ""
-                content_tag = entry.find("content")
-                body = BeautifulSoup(content_tag.text, "html.parser").get_text()[:600].strip() if content_tag else ""
-                author_tag = entry.find("author")
-                name_tag = author_tag.find("name") if author_tag else None
-                author = name_tag.text if name_tag else "unknown"
+                # Заголовок
+                title_el = entry.find("{http://www.w3.org/2005/Atom}title")
+                if title_el is None:
+                    title_el = entry.find("title")
+                title = title_el.text.strip() if title_el is not None else ""
 
-                if not any(kw in (title + " " + body).lower() for kw in REDDIT_KEYWORDS):
+                # Ссылка
+                link_el = entry.find("{http://www.w3.org/2005/Atom}link")
+                if link_el is None:
+                    link_el = entry.find("link")
+                link = ""
+                if link_el is not None:
+                    link = link_el.get("href", "") or link_el.text or ""
+
+                # Автор
+                author_el = entry.find(".//{http://www.w3.org/2005/Atom}name")
+                author = author_el.text if author_el is not None else "unknown"
+
+                # Контент
+                content_el = entry.find("{http://www.w3.org/2005/Atom}content")
+                if content_el is None:
+                    content_el = entry.find("content")
+                body = ""
+                if content_el is not None and content_el.text:
+                    body = BeautifulSoup(content_el.text, "html.parser").get_text()[:500]
+
+                full_text = (title + " " + body).lower()
+                if not any(kw in full_text for kw in KEYWORDS):
                     continue
 
                 mark_seen(post_id, "reddit")
                 priority = get_priority(title + " " + body)
-                body_block = f"\n\n📄 *Текст:*\n{body}..." if body else ""
+                body_block = f"\n\n📄 *Текст:*\n{body[:400]}..." if body.strip() else ""
 
                 send(
                     f"{priority}\n"
@@ -140,72 +173,20 @@ def check_reddit():
                 )
                 found += 1
                 time.sleep(1)
-            time.sleep(3)
+
+            time.sleep(4)
+
         except Exception as e:
             log.error(f"r/{sub}: {e}")
+
     log.info(f"Reddit: {found} новых")
-
-def check_x():
-    log.info("🔍 X...")
-    found = 0
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"}
-    nitter_instances = [
-        "https://nitter.poast.org",
-        "https://nitter.privacydev.net",
-        "https://nitter.net",
-    ]
-    for keyword in X_KEYWORDS[:5]:
-        try:
-            query = requests.utils.quote(f"{keyword} lang:en")
-            resp = None
-            for instance in nitter_instances:
-                try:
-                    resp = requests.get(f"{instance}/search?q={query}&f=tweets", headers=headers, timeout=10)
-                    if resp.status_code == 200:
-                        break
-                except:
-                    continue
-            if not resp or resp.status_code != 200:
-                continue
-
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for tweet in soup.select(".timeline-item")[:8]:
-                link_tag = tweet.select_one(".tweet-link")
-                if not link_tag:
-                    continue
-                tweet_path = link_tag.get("href", "")
-                tweet_id = f"x_{abs(hash(tweet_path))}"
-                if is_seen(tweet_id):
-                    continue
-
-                text_tag = tweet.select_one(".tweet-content")
-                text = text_tag.get_text().strip()[:500] if text_tag else ""
-                user_tag = tweet.select_one(".username")
-                username = user_tag.get_text().strip() if user_tag else "unknown"
-                date_tag = tweet.select_one(".tweet-date a")
-                date_str = date_tag.get_text().strip() if date_tag else ""
-
-                mark_seen(tweet_id, "x")
-                send(
-                    f"{get_priority(text)}\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📌 *X (Twitter)*\n"
-                    f"👤 {username}  🕐 {date_str}\n"
-                    f"🔑 *Запрос:* {keyword}\n\n"
-                    f"📝 {text}\n\n"
-                    f"🔗 https://x.com{tweet_path}"
-                )
-                found += 1
-                time.sleep(1)
-            time.sleep(4)
-        except Exception as e:
-            log.error(f"X '{keyword}': {e}")
-    log.info(f"X: {found} новых")
+    return found
 
 def check_quora():
     log.info("🔍 Quora...")
     found = 0
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"}
+
     for query in QUORA_QUERIES:
         try:
             resp = requests.get(
@@ -229,7 +210,7 @@ def check_quora():
                     continue
                 mark_seen(post_id, "quora")
                 send(
-                    f"{get_priority(title + snippet)}\n"
+                    f"{get_priority(title+snippet)}\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"📌 *Quora*\n"
                     f"❓ {title[:200]}\n\n"
@@ -241,23 +222,26 @@ def check_quora():
             time.sleep(6)
         except Exception as e:
             log.error(f"Quora: {e}")
+
     log.info(f"Quora: {found} новых")
 
 def send_daily_stats():
     rows = total_seen()
-    stats = "\n".join([f"  • {src}: {cnt} постов" for src, cnt in rows]) or "  Пока пусто"
-    send(f"📊 *Статистика ResumeUSA Monitor*\n━━━━━━━━━━━━━━━━━━━━\n{stats}\n\n🕐 {datetime.now().strftime('%d.%m.%Y %H:%M')}")
+    stats = "\n".join([f"  • {src}: {cnt}" for src, cnt in rows]) or "  Пока пусто"
+    send(f"📊 *Статистика*\n━━━━━━━━━━━━━━━━━━━━\n{stats}\n\n🕐 {datetime.now().strftime('%d.%m.%Y %H:%M')}")
 
 def main():
     init_db()
-    send("🚀 *ResumeUSA Monitor запущен!*\n\n📌 Reddit — каждые 10 минут\n🐦 X — каждые 15 минут\n❓ Quora — каждые 30 минут\n\nБуду присылать горячие посты 🔥")
+    log.info("🚀 ResumeUSA Monitor v4 запущен!")
+    send("🚀 *ResumeUSA Monitor v4 запущен!*\n\n📌 Reddit — каждые 10 минут\n❓ Quora — каждые 30 минут\n\nБуду присылать горячие посты 🔥")
+
     schedule.every(10).minutes.do(check_reddit)
-    schedule.every(15).minutes.do(check_x)
     schedule.every(30).minutes.do(check_quora)
     schedule.every().day.at("09:00").do(send_daily_stats)
+
     check_reddit()
-    check_x()
     check_quora()
+
     while True:
         schedule.run_pending()
         time.sleep(30)
